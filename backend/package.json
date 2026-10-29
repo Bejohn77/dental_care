@@ -1,0 +1,20 @@
+{
+  "name": "medico-dental-care-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MongoDB API for Medico Dental Care.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --watch server.mjs",
+    "build": "node --check server.mjs && node --check scripts/create-admin.mjs",
+    "start": "node --env-file-if-exists=.env server.mjs",
+    "create-admin": "node --env-file-if-exists=.env scripts/create-admin.mjs"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "mongodb": "^7.7.0"
+  }
+}
