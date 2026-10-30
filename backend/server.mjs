@@ -314,10 +314,10 @@ databasePromise
       console.log(`Medico Dental API listening on port ${port}`);
     });
   })
-  .catch(() => {
-    console.error("MongoDB connection failed during startup.");
-    process.exitCode = 1;
-  });
+  .catch((error) => {
+  console.error("MongoDB connection failed during startup:", error);
+  process.exitCode = 1;
+});
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => server.close(async () => {
