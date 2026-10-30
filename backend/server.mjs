@@ -1,12 +1,14 @@
 import { createServer } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { MongoClient } from "mongodb";
 import { compare, hash } from "bcryptjs";
 
 const port = Number(process.env.PORT ?? 10000);
 const uri = process.env.MONGODB_URI;
 const databaseName = process.env.MONGODB_DB;
-const apiKey = process.env.BACKEND_API_KEY;
+const jwtSecret = process.env.JWT_SECRET;
+const sessionDurationSeconds = 60 * 60 * 24 * 7;
+const sessionCookieName = "medico_session";
 const allowedOrigins = new Set(
   (process.env.FRONTEND_ORIGINS ?? "")
     .split(",")
@@ -19,8 +21,8 @@ const tables = new Set([
   "agreements", "invoices", "payments",
 ]);
 
-if (!uri || !databaseName || !apiKey || apiKey.length < 32 || !allowedOrigins.size) {
-  throw new Error("MONGODB_URI, MONGODB_DB, a 32-character BACKEND_API_KEY, and FRONTEND_ORIGINS are required.");
+if (!uri || !databaseName || !jwtSecret || jwtSecret.length < 32 || !allowedOrigins.size) {
+  throw new Error("MONGODB_URI, MONGODB_DB, a 32-character JWT_SECRET, and FRONTEND_ORIGINS are required.");
 }
 
 const client = new MongoClient(uri, {
@@ -31,6 +33,8 @@ const databasePromise = client.connect().then(async () => {
   const database = client.db(databaseName);
   await Promise.all([
     database.collection("users").createIndex({ email: 1 }, { unique: true }),
+    database.collection("auth_sessions").createIndex({ jti: 1 }, { unique: true }),
+    database.collection("auth_sessions").createIndex({ expires_at: 1 }, { expireAfterSeconds: 0 }),
     ...[...tables].filter((table) => table !== "users").map((table) =>
       database.collection(table).createIndex({ id: 1 }, { unique: true })
     ),
@@ -59,10 +63,99 @@ const relationSpecs = {
   },
 };
 
-function safeEqual(left, right) {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
+function signJwt(payload) {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const unsignedToken = `${header}.${body}`;
+  const signature = createHmac("sha256", jwtSecret).update(unsignedToken).digest("base64url");
+  return `${unsignedToken}.${signature}`;
+}
+
+function readSessionCookie(request) {
+  const cookie = String(request.headers.cookie ?? "")
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${sessionCookieName}=`));
+  return cookie?.slice(sessionCookieName.length + 1) ?? null;
+}
+
+async function authenticateRequest(request) {
+  const token = readSessionCookie(request);
+  if (!token) return null;
+
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+
+  let header;
+  let payload;
+  try {
+    header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+    payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+
+  if (
+    !header ||
+    typeof header !== "object" ||
+    header.alg !== "HS256" ||
+    header.typ !== "JWT" ||
+    !payload ||
+    typeof payload !== "object"
+  ) {
+    return null;
+  }
+
+  const expected = createHmac("sha256", jwtSecret)
+    .update(`${parts[0]}.${parts[1]}`)
+    .digest();
+  const actual = Buffer.from(parts[2], "base64url");
+  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    typeof payload.sub !== "string" ||
+    typeof payload.jti !== "string" ||
+    payload.iss !== "medico-dental-care-api" ||
+    payload.aud !== "medico-dental-care-frontend" ||
+    !Number.isInteger(payload.exp) ||
+    payload.exp <= now ||
+    !Number.isInteger(payload.iat) ||
+    payload.iat > now + 60
+  ) {
+    return null;
+  }
+
+  const session = await (await databasePromise)
+    .collection("auth_sessions")
+    .findOne({ jti: payload.jti, user_id: payload.sub, expires_at: { $gt: new Date() } });
+  return session ? { userId: payload.sub, jti: payload.jti } : null;
+}
+
+function sessionCookie(token, maxAge) {
+  return `${sessionCookieName}=${token}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`;
+}
+
+async function createSession(profileId) {
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const expiresAt = new Date((issuedAt + sessionDurationSeconds) * 1000);
+  const jti = randomUUID();
+  await (await databasePromise).collection("auth_sessions").insertOne({
+    jti,
+    user_id: profileId,
+    expires_at: expiresAt,
+  });
+  return {
+    token: signJwt({
+      iss: "medico-dental-care-api",
+      aud: "medico-dental-care-frontend",
+      sub: profileId,
+      jti,
+      iat: issuedAt,
+      exp: Math.floor(expiresAt.getTime() / 1000),
+    }),
+    expiresAt,
+  };
 }
 
 function parseJoins(select) {
@@ -178,6 +271,37 @@ async function query(input) {
   return { data, error: null, ...(count === undefined ? {} : { count }) };
 }
 
+async function queryPublic(input) {
+  const { table, action = "find", filters = {} } = input;
+  if (
+    !["doctors", "services"].includes(table) ||
+    action !== "find" ||
+    filters.is_active !== true ||
+    Object.keys(filters).length !== 1
+  ) {
+    const error = new Error("Authentication is required for this database request.");
+    error.status = 401;
+    throw error;
+  }
+
+  const fields = table === "doctors"
+    ? ["id", "name", "designation", "speciality", "bio", "consultation_fee", "photo_url", "is_active"]
+    : ["id", "name", "category", "description", "base_price", "is_tooth_based", "is_active"];
+  const limit = Number.isInteger(input.maxResults) && input.maxResults >= 0
+    ? Math.min(input.maxResults, 100)
+    : 100;
+  const documents = await (await databasePromise)
+    .collection(table)
+    .find({ is_active: true })
+    .sort({ name: 1 })
+    .limit(limit)
+    .toArray();
+  const data = documents.map((document) =>
+    Object.fromEntries(fields.filter((field) => field in document).map((field) => [field, document[field]]))
+  );
+  return { data, error: null };
+}
+
 async function rpc(name, args) {
   if (name !== "get_available_slots") throw new Error("Unknown database operation.");
   const { p_date: date, p_doctor_id: doctorId } = args;
@@ -213,23 +337,37 @@ async function auth(path, body) {
   const profiles = database.collection("profiles");
   if (path === "/api/auth/register") {
     const { full_name, email, password, phone, age, sex, address } = body;
-    if (typeof full_name !== "string" || !full_name.trim() || typeof email !== "string" || !email.includes("@") || typeof password !== "string" || password.length < 8) {
+    if (
+      typeof full_name !== "string" ||
+      !full_name.trim() ||
+      typeof email !== "string" ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
+      typeof password !== "string" ||
+      password.length < 8 ||
+      typeof phone !== "string"
+    ) {
       return { status: 400, body: { error: "Invalid registration details." } };
     }
-    if (!["male", "female", "other"].includes(sex) || (age !== null && (!Number.isInteger(age) || age < 0 || age > 120))) {
+    if (
+      !["male", "female", "other"].includes(sex) ||
+      (age !== null && (!Number.isInteger(age) || age < 0 || age > 120)) ||
+      (address !== null && typeof address !== "string")
+    ) {
       return { status: 400, body: { error: "Invalid profile details." } };
     }
-    const id = crypto.randomUUID();
+    const id = randomUUID();
     const now = new Date().toISOString();
-    await users.insertOne({ id, email: email.trim().toLowerCase(), password_hash: await hash(password, 12), created_at: now });
-    const profile = { id, full_name: full_name.trim(), email: email.trim().toLowerCase(), phone: phone || null, age, sex, address: address || null, role: "patient", created_at: now, updated_at: now };
+    const normalizedEmail = email.trim().toLowerCase();
+    await users.insertOne({ id, email: normalizedEmail, password_hash: await hash(password, 12), created_at: now });
+    const profile = { id, full_name: full_name.trim(), email: normalizedEmail, phone: phone || null, age, sex, address: address || null, role: "patient", created_at: now, updated_at: now };
     try {
       await profiles.insertOne(profile);
     } catch (error) {
       await users.deleteOne({ id });
       throw error;
     }
-    return { status: 201, body: { profile } };
+    const session = await createSession(id);
+    return { status: 201, body: { profile }, headers: { "Set-Cookie": sessionCookie(session.token, sessionDurationSeconds) } };
   }
   if (path === "/api/auth/login") {
     const email = String(body.email ?? "").trim().toLowerCase();
@@ -239,11 +377,21 @@ async function auth(path, body) {
       return { status: 401, body: { error: "Invalid email or password." } };
     }
     const profile = await profiles.findOne({ id: user.id });
-    return profile ? { status: 200, body: { profile } } : { status: 401, body: { error: "Invalid email or password." } };
+    if (!profile) return { status: 401, body: { error: "Invalid email or password." } };
+    const session = await createSession(profile.id);
+    return { status: 200, body: { profile }, headers: { "Set-Cookie": sessionCookie(session.token, sessionDurationSeconds) } };
   }
   if (path === "/api/auth/profile") {
-    const profile = await profiles.findOne({ id: body.profileId });
+    const profile = await profiles.findOne({ id: body.session.userId });
     return { status: 200, body: { profile: profile ?? null } };
+  }
+  if (path === "/api/auth/logout") {
+    await database.collection("auth_sessions").deleteOne({ jti: body.session.jti });
+    return {
+      status: 200,
+      body: { success: true },
+      headers: { "Set-Cookie": sessionCookie("", 0) },
+    };
   }
   return { status: 404, body: { error: "Not found." } };
 }
@@ -253,10 +401,20 @@ async function readJson(request) {
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 1_000_000) throw new Error("Request body too large.");
+    if (size > 1_000_000) {
+      const error = new Error("Request body too large.");
+      error.status = 413;
+      throw error;
+    }
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch {
+    const error = new Error("Invalid JSON request body.");
+    error.status = 400;
+    throw error;
+  }
 }
 
 const server = createServer(async (request, response) => {
@@ -265,7 +423,8 @@ const server = createServer(async (request, response) => {
     response.setHeader("Access-Control-Allow-Origin", origin);
     response.setHeader("Vary", "Origin");
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    response.setHeader("Access-Control-Allow-Credentials", "true");
   } else if (origin && allowedOrigins.size) {
     response.writeHead(403).end();
     return;
@@ -284,27 +443,45 @@ const server = createServer(async (request, response) => {
     }
     return;
   }
-  if (request.method !== "POST" || !["/api/query", "/api/rpc", "/api/auth/register", "/api/auth/login", "/api/auth/profile"].includes(path)) {
+  if (request.method !== "POST" || !["/api/query", "/api/rpc", "/api/auth/register", "/api/auth/login", "/api/auth/profile", "/api/auth/logout"].includes(path)) {
     response.writeHead(404).end();
-    return;
-  }
-  if (!safeEqual(String(request.headers["x-api-key"] ?? ""), apiKey)) {
-    response.writeHead(401, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "Unauthorized." }));
     return;
   }
   try {
     const body = await readJson(request);
+    const publicAuthRoute = path === "/api/auth/register" || path === "/api/auth/login";
+    const session = publicAuthRoute ? null : await authenticateRequest(request);
+    if (!publicAuthRoute && !session && !["/api/query", "/api/rpc"].includes(path)) {
+      response.writeHead(401, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      response.end(JSON.stringify({ error: "Unauthorized." }));
+      return;
+    }
+
     const result = path === "/api/query"
-      ? { status: 200, body: await query(body) }
+      ? { status: 200, body: session ? await query(body) : await queryPublic(body) }
       : path === "/api/rpc"
         ? { status: 200, body: await rpc(body.name, body.args ?? {}) }
-        : await auth(path, body);
-    response.writeHead(result.status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        : await auth(path, { ...body, session });
+    response.writeHead(result.status, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      ...result.headers,
+    });
     response.end(JSON.stringify(result.body));
   } catch (error) {
     const duplicate = error && typeof error === "object" && error.code === 11000;
-    response.writeHead(duplicate ? 409 : 400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-    response.end(JSON.stringify({ error: duplicate ? "An account with this email already exists." : error instanceof Error ? error.message : "Request failed." }));
+    const status = duplicate ? 409 : error?.status ?? 500;
+    if (status >= 500) console.error("API request failed:", error);
+    response.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    response.end(JSON.stringify({
+      error: duplicate
+        ? "An account with this email already exists."
+        : status >= 500
+          ? "The request could not be completed."
+          : error instanceof Error
+            ? error.message
+            : "Request failed.",
+    }));
   }
 });
 

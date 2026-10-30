@@ -1,15 +1,21 @@
+import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { backendRequest } from "@/lib/api/client";
-import { getSessionProfileId } from "@/lib/auth/session";
+import { backendRequest, BackendApiError } from "@/lib/api/client";
 import type { Profile, UserRole } from "@/types/app";
 
 export async function getCurrentProfile(): Promise<Profile | null> {
-  const profileId = await getSessionProfileId();
-  if (!profileId) return null;
-  const result = await backendRequest<{ profile: Profile | null }>("/api/auth/profile", {
-    profileId,
-  });
-  return result.profile;
+  if (!(await cookies()).has("medico_session")) return null;
+
+  try {
+    const result = await backendRequest<{ profile: Profile | null }>(
+      "/api/auth/profile",
+      {}
+    );
+    return result.profile;
+  } catch (error) {
+    if (error instanceof BackendApiError && error.status === 401) return null;
+    throw error;
+  }
 }
 
 export async function requireProfile(): Promise<Profile> {

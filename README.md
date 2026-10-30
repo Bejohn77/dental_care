@@ -1,10 +1,10 @@
 # Medico Dental Care
 
-The repository uses npm and Node.js 20.19 or newer. `frontend/` is a Next.js 16 application; `backend/` is a standalone Node.js MongoDB API. MongoDB Atlas hosts the database. The frontend keeps the HTTP-only session cookie and calls the backend from server actions/server components through one server-only API client. The MongoDB URI is only configured on the backend.
+The repository uses npm and Node.js 20.19 or newer. `frontend/` is a Next.js 16 application; `backend/` is a standalone Node.js MongoDB API. MongoDB Atlas and the JWT signing key are backend-only. The backend issues and validates JWT sessions; the frontend holds the token only in an HTTP-only cookie and forwards it from server-side requests.
 
 ## Deploy Backend to Render
 
-Create a **Web Service** from this repository with:
+Create a **Web Service** from this repository:
 
 | Setting | Value |
 | --- | --- |
@@ -18,12 +18,14 @@ Set these Render environment variables:
 
 | Variable | Value |
 | --- | --- |
-| `MONGODB_URI` | MongoDB Atlas connection string; allow Render's outbound IPs or use Atlas network access appropriate to your plan |
-| `MONGODB_DB` | `medico_dental_care` (or your chosen database name) |
-| `BACKEND_API_KEY` | Random secret of at least 32 characters; use the same value in Vercel |
-| `FRONTEND_ORIGINS` | Comma-separated exact browser origins, with no trailing slash, e.g. `https://your-app.vercel.app,https://your-domain.example` |
+| `MONGODB_URI` | MongoDB Atlas connection string; configure Atlas network access for Render |
+| `MONGODB_DB` | `medico_dental_care` or your chosen database name |
+| `JWT_SECRET` | Random secret of at least 32 characters; keep it only in Render |
+| `FRONTEND_ORIGINS` | Comma-separated exact Vercel origins, without trailing slashes |
 
-Render supplies `PORT`; the service listens on `0.0.0.0`. `/health` returns success only when MongoDB responds to a ping. Add each Vercel production/preview origin that must call the API to `FRONTEND_ORIGINS`; this allowlist is exact-match. The API key remains required for API requests even when CORS is configured.
+Add your Vercel production domain and any preview domains that need access to `FRONTEND_ORIGINS`, for example `https://your-app.vercel.app,https://your-domain.example`. Render supplies `PORT`; the service listens on `0.0.0.0`. CORS allows credentials only from these exact origins. The `/health` endpoint checks MongoDB connectivity.
+
+The backend sets an HTTP-only session cookie and requires a valid, unexpired backend-issued JWT for protected API requests. Logout revokes the token's server-side session. Session records expire automatically. The frontend server action transfers the cookie to the Vercel domain so the browser does not need to access Render's cross-site cookie directly.
 
 ## Deploy Frontend to Vercel
 
@@ -37,19 +39,17 @@ Import the same repository into Vercel and set:
 | Build Command | `npm run build` |
 | Output Directory | Leave the Next.js default |
 
-Set these Vercel environment variables for the required environments:
+Set this Vercel environment variable:
 
 | Variable | Value |
 | --- | --- |
 | `BACKEND_API_URL` | Render service origin, e.g. `https://your-api.onrender.com` (no path suffix) |
-| `BACKEND_API_KEY` | The same secret configured on Render |
-| `SESSION_SECRET` | Independent random secret of at least 32 characters |
 
-Do not prefix these values with `NEXT_PUBLIC_`. Production session cookies are `HttpOnly`, `Secure`, and `SameSite=Lax`; the browser never receives the backend API key. Vercel preview domains must also be listed exactly in Render's `FRONTEND_ORIGINS` if browser-origin requests are added in the future.
+Do not add `JWT_SECRET`, MongoDB credentials, or an API key to Vercel. The Vercel session cookie is HTTP-only, secure in production, and SameSite=Lax. The backend JWT secret is never included in the frontend.
 
 ## Local Development
 
-Copy `backend/.env.example` to `backend/.env` and set real backend-only credentials. Copy `frontend/.env.example` to `frontend/.env.local`, set `BACKEND_API_URL=http://localhost:10000`, and use the same `BACKEND_API_KEY` as the backend. Run each process in a separate terminal:
+Copy `backend/.env.example` to `backend/.env` and set your local MongoDB connection, a local JWT secret, and `FRONTEND_ORIGINS=http://localhost:3000`. Copy `frontend/.env.example` to `frontend/.env.local` and set `BACKEND_API_URL=http://localhost:10000`. Run each process in a separate terminal:
 
 ```powershell
 Push-Location backend
@@ -65,7 +65,7 @@ npm run dev
 Pop-Location
 ```
 
-For local browser-origin API calls, include the local frontend origin in `backend/.env` as `FRONTEND_ORIGINS=http://localhost:3000`.
+Do not reuse a production JWT secret for local development.
 
 ## Admin Bootstrap and Checks
 
@@ -84,4 +84,4 @@ npm ci
 npm run build
 ```
 
-The frontend also has `npm run lint` and `npm run typecheck`. There is no automated test suite configured yet. Keep `.env`, `.env.local`, and all real credentials out of version control; `.env.example` files contain placeholders only. A MongoDB credential was present in the previous backend template: rotate that database user's password before deployment, even though the checked-in template has been sanitized.
+The frontend also has `npm run lint` and `npm run typecheck`. There is no automated test suite configured yet. Keep `.env`, `.env.local`, and all real credentials out of version control; `.env.example` files contain placeholders only. Rotate any MongoDB credential that was previously committed.

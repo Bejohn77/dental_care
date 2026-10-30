@@ -1,7 +1,7 @@
 "use server";
 
 import { redirect } from "next/navigation";
-import { BackendApiError } from "@/lib/api/client";
+import { backendRequest, BackendApiError } from "@/lib/api/client";
 import {
   authenticateAccount,
   clearSession,
@@ -47,9 +47,9 @@ export async function registerAction(formData: FormData) {
     redirectWithError("/register", "Please enter a valid age");
   }
 
-  let profile;
+  let account;
   try {
-    profile = await createProfileAccount({
+    account = await createProfileAccount({
       full_name: fullName,
       email,
       password,
@@ -65,9 +65,12 @@ export async function registerAction(formData: FormData) {
     ) {
       redirectWithError("/register", "An account with this email already exists");
     }
+    if (error instanceof BackendApiError) {
+      redirectWithError("/register", error.message);
+    }
     throw error;
   }
-  await setSession(profile.id);
+  await setSession(account.token);
 
   redirect("/dashboard");
 }
@@ -80,16 +83,31 @@ export async function loginAction(formData: FormData) {
     redirectWithError("/login", "Email and password are required");
   }
 
-  const profile = await authenticateAccount(email, password);
-  if (!profile) {
+  let account;
+  try {
+    account = await authenticateAccount(email, password);
+  } catch (error) {
+    if (error instanceof BackendApiError) {
+      redirectWithError("/login", error.message);
+    }
+    throw error;
+  }
+  if (!account) {
     redirectWithError("/login", "Invalid email or password");
   }
-  await setSession(profile.id);
+  await setSession(account.token);
 
   redirect("/dashboard");
 }
 
 export async function logoutAction() {
+  try {
+    await backendRequest("/api/auth/logout", {});
+  } catch (error) {
+    if (!(error instanceof BackendApiError && error.status === 401)) {
+      throw error;
+    }
+  }
   await clearSession();
   redirect("/login");
 }
