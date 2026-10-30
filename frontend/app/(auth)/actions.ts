@@ -17,6 +17,10 @@ function redirectWithError(path: string, message: string): never {
   redirect(`${path}?error=${encodeURIComponent(message)}`);
 }
 
+export type LoginActionState = {
+  error: string | null;
+};
+
 export async function registerAction(formData: FormData) {
   const fullName = safeString(formData.get("full_name"));
   const email = safeString(formData.get("email")).toLowerCase();
@@ -75,12 +79,18 @@ export async function registerAction(formData: FormData) {
   redirect("/dashboard");
 }
 
-export async function loginAction(formData: FormData) {
+export async function loginAction(
+  _previousState: LoginActionState,
+  formData: FormData
+): Promise<LoginActionState> {
   const email = safeString(formData.get("email")).toLowerCase();
-  const password = safeString(formData.get("password"));
+  const password = String(formData.get("password") ?? "");
 
-  if (!email || !password) {
-    redirectWithError("/login", "Email and password are required");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { error: "Enter a valid email address." };
+  }
+  if (password.length < 8) {
+    return { error: "Password must be at least 8 characters." };
   }
 
   let account;
@@ -88,14 +98,25 @@ export async function loginAction(formData: FormData) {
     account = await authenticateAccount(email, password);
   } catch (error) {
     if (error instanceof BackendApiError) {
-      redirectWithError("/login", error.message);
+      if (error.status === 401) {
+        return { error: "Invalid email or password." };
+      }
+      if (error.status >= 500) {
+        return { error: "The login service is temporarily unavailable. Please try again." };
+      }
+      return { error: error.message };
     }
-    throw error;
+    return { error: "Unable to connect to the login service. Please try again." };
   }
   if (!account) {
-    redirectWithError("/login", "Invalid email or password");
+    return { error: "Invalid email or password." };
   }
-  await setSession(account.token);
+
+  try {
+    await setSession(account.token);
+  } catch {
+    return { error: "Your session could not be saved. Please try again." };
+  }
 
   redirect("/dashboard");
 }

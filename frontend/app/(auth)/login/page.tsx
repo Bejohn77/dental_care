@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { loginAction } from "@/app/(auth)/actions";
+import LoginForm from "@/app/(auth)/login/LoginForm";
 
 type LoginPageProps = {
   searchParams: Promise<{
@@ -34,38 +34,7 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
           </div>
         )}
 
-        <form action={loginAction} className="mt-6 space-y-4">
-          <div>
-            <label className="text-sm font-medium text-slate-700">Email</label>
-            <input
-              name="email"
-              type="email"
-              required
-              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-900 placeholder:text-slate-400 outline-none focus:border-teal-600"
-              placeholder="patient@email.com"
-            />
-          </div>
-
-          <div>
-            <label className="text-sm font-medium text-slate-700">
-              Password
-            </label>
-            <input
-              name="password"
-              type="password"
-              required
-              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-slate-900 placeholder:text-slate-400 outline-none focus:border-teal-600"
-              placeholder="******"
-            />
-          </div>
-
-          <button
-            type="submit"
-            className="w-full rounded-lg bg-teal-600 px-4 py-2.5 font-semibold text-white hover:bg-teal-700"
-          >
-            Login
-          </button>
-        </form>
+        <LoginForm />
 
         <p className="mt-6 text-center text-sm text-slate-600">
           New patient?{" "}
