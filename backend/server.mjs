@@ -1,12 +1,16 @@
 import { createServer } from "node:http";
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { MongoClient } from "mongodb";
-import { compare, hash } from "bcryptjs";
+import { authenticateAccount, registerPatient } from "./account-service.mjs";
+import { ensureAdminAccount, getAdminCredentials } from "./admin-bootstrap.mjs";
+import { signSessionToken, verifySessionToken } from "./session-token.mjs";
+import { authorizeDatabaseQuery } from "./authorization.mjs";
 
 const port = Number(process.env.PORT ?? 10000);
 const uri = process.env.MONGODB_URI;
 const databaseName = process.env.MONGODB_DB;
 const jwtSecret = process.env.JWT_SECRET;
+const adminCredentials = getAdminCredentials();
 const sessionDurationSeconds = 60 * 60 * 24 * 7;
 const sessionCookieName = "medico_session";
 const allowedOrigins = new Set(
@@ -63,14 +67,6 @@ const relationSpecs = {
   },
 };
 
-function signJwt(payload) {
-  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
-  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  const unsignedToken = `${header}.${body}`;
-  const signature = createHmac("sha256", jwtSecret).update(unsignedToken).digest("base64url");
-  return `${unsignedToken}.${signature}`;
-}
-
 function readSessionCookie(request) {
   const cookie = String(request.headers.cookie ?? "")
     .split(";")
@@ -83,53 +79,18 @@ async function authenticateRequest(request) {
   const token = readSessionCookie(request);
   if (!token) return null;
 
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-
-  let header;
-  let payload;
-  try {
-    header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
-    payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-  } catch {
-    return null;
-  }
-
-  if (
-    !header ||
-    typeof header !== "object" ||
-    header.alg !== "HS256" ||
-    header.typ !== "JWT" ||
-    !payload ||
-    typeof payload !== "object"
-  ) {
-    return null;
-  }
-
-  const expected = createHmac("sha256", jwtSecret)
-    .update(`${parts[0]}.${parts[1]}`)
-    .digest();
-  const actual = Buffer.from(parts[2], "base64url");
-  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
-
-  const now = Math.floor(Date.now() / 1000);
-  if (
-    typeof payload.sub !== "string" ||
-    typeof payload.jti !== "string" ||
-    payload.iss !== "medico-dental-care-api" ||
-    payload.aud !== "medico-dental-care-frontend" ||
-    !Number.isInteger(payload.exp) ||
-    payload.exp <= now ||
-    !Number.isInteger(payload.iat) ||
-    payload.iat > now + 60
-  ) {
-    return null;
-  }
+  const payload = verifySessionToken(token, jwtSecret);
+  if (!payload) return null;
 
   const session = await (await databasePromise)
     .collection("auth_sessions")
     .findOne({ jti: payload.jti, user_id: payload.sub, expires_at: { $gt: new Date() } });
-  return session ? { userId: payload.sub, jti: payload.jti } : null;
+  if (!session) return null;
+
+  const profile = await (await databasePromise)
+    .collection("profiles")
+    .findOne({ id: payload.sub }, { projection: { role: 1 } });
+  return profile ? { userId: payload.sub, jti: payload.jti, role: profile.role } : null;
 }
 
 function sessionCookie(token, maxAge) {
@@ -146,14 +107,13 @@ async function createSession(profileId) {
     expires_at: expiresAt,
   });
   return {
-    token: signJwt({
-      iss: "medico-dental-care-api",
-      aud: "medico-dental-care-frontend",
-      sub: profileId,
+    token: signSessionToken(
+      profileId,
       jti,
-      iat: issuedAt,
-      exp: Math.floor(expiresAt.getTime() / 1000),
-    }),
+      issuedAt,
+      Math.floor(expiresAt.getTime() / 1000),
+      jwtSecret
+    ),
     expiresAt,
   };
 }
@@ -333,50 +293,14 @@ async function rpc(name, args) {
 
 async function auth(path, body) {
   const database = await databasePromise;
-  const users = database.collection("users");
   const profiles = database.collection("profiles");
   if (path === "/api/auth/register") {
-    const { full_name, email, password, phone, age, sex, address } = body;
-    if (
-      typeof full_name !== "string" ||
-      !full_name.trim() ||
-      typeof email !== "string" ||
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
-      typeof password !== "string" ||
-      password.length < 8 ||
-      typeof phone !== "string"
-    ) {
-      return { status: 400, body: { error: "Invalid registration details." } };
-    }
-    if (
-      !["male", "female", "other"].includes(sex) ||
-      (age !== null && (!Number.isInteger(age) || age < 0 || age > 120)) ||
-      (address !== null && typeof address !== "string")
-    ) {
-      return { status: 400, body: { error: "Invalid profile details." } };
-    }
-    const id = randomUUID();
-    const now = new Date().toISOString();
-    const normalizedEmail = email.trim().toLowerCase();
-    await users.insertOne({ id, email: normalizedEmail, password_hash: await hash(password, 12), created_at: now });
-    const profile = { id, full_name: full_name.trim(), email: normalizedEmail, phone: phone || null, age, sex, address: address || null, role: "patient", created_at: now, updated_at: now };
-    try {
-      await profiles.insertOne(profile);
-    } catch (error) {
-      await users.deleteOne({ id });
-      throw error;
-    }
-    const session = await createSession(id);
+    const profile = await registerPatient(database, body);
+    const session = await createSession(profile.id);
     return { status: 201, body: { profile }, headers: { "Set-Cookie": sessionCookie(session.token, sessionDurationSeconds) } };
   }
   if (path === "/api/auth/login") {
-    const email = String(body.email ?? "").trim().toLowerCase();
-    const password = String(body.password ?? "");
-    const user = await users.findOne({ email });
-    if (!user || !(await compare(password, user.password_hash ?? ""))) {
-      return { status: 401, body: { error: "Invalid email or password." } };
-    }
-    const profile = await profiles.findOne({ id: user.id });
+    const profile = await authenticateAccount(database, body.email, body.password);
     if (!profile) return { status: 401, body: { error: "Invalid email or password." } };
     const session = await createSession(profile.id);
     return { status: 200, body: { profile }, headers: { "Set-Cookie": sessionCookie(session.token, sessionDurationSeconds) } };
@@ -458,7 +382,12 @@ const server = createServer(async (request, response) => {
     }
 
     const result = path === "/api/query"
-      ? { status: 200, body: session ? await query(body) : await queryPublic(body) }
+      ? {
+          status: 200,
+          body: session && authorizeDatabaseQuery(body, session)
+            ? await query(body)
+            : await queryPublic(body),
+        }
       : path === "/api/rpc"
         ? { status: 200, body: await rpc(body.name, body.args ?? {}) }
         : await auth(path, { ...body, session });
@@ -486,13 +415,15 @@ const server = createServer(async (request, response) => {
 });
 
 databasePromise
-  .then(() => {
+  .then(async (database) => {
+    const created = await ensureAdminAccount(database, adminCredentials);
+    console.log(created ? "Initial admin account created." : "Admin account is ready.");
     server.listen(port, "0.0.0.0", () => {
       console.log(`Medico Dental API listening on port ${port}`);
     });
   })
   .catch((error) => {
-  console.error("MongoDB connection failed during startup:", error);
+  console.error("Backend startup failed:", error);
   process.exitCode = 1;
 });
 

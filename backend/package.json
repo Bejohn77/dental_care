@@ -9,9 +9,10 @@
   },
   "scripts": {
     "dev": "node --env-file-if-exists=.env --watch server.mjs",
-    "build": "node --check server.mjs && node --check scripts/create-admin.mjs",
+    "build": "node --check server.mjs && node --check admin-bootstrap.mjs && node --check account-service.mjs && node --check authorization.mjs && node --check session-token.mjs && node --check scripts/create-admin.mjs && node --check test/auth.test.mjs",
     "start": "node --env-file-if-exists=.env server.mjs",
-    "create-admin": "node --env-file-if-exists=.env scripts/create-admin.mjs"
+    "create-admin": "node --env-file-if-exists=.env scripts/create-admin.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

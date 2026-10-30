@@ -21,9 +21,13 @@ Set these Render environment variables:
 | `MONGODB_URI` | MongoDB Atlas connection string; configure Atlas network access for Render |
 | `MONGODB_DB` | `medico_dental_care` or your chosen database name |
 | `JWT_SECRET` | Random secret of at least 32 characters; keep it only in Render |
+| `ADMIN_EMAIL` | Email for the initial administrator account |
+| `ADMIN_PASSWORD` | Unique password for that account; at least 12 characters |
 | `FRONTEND_ORIGINS` | Comma-separated exact Vercel origins, without trailing slashes |
 
 Add your Vercel production domain and any preview domains that need access to `FRONTEND_ORIGINS`, for example `https://your-app.vercel.app,https://your-domain.example`. Render supplies `PORT`; the service listens on `0.0.0.0`. CORS allows credentials only from these exact origins. The `/health` endpoint checks MongoDB connectivity.
+
+On startup, the backend validates `ADMIN_EMAIL` and `ADMIN_PASSWORD` and creates the admin account if it does not exist. The password is bcrypt-hashed before storage; an existing account's password is never reset during restarts. Keep both variables only in Render. Admin database operations are checked against the authenticated profile role by the backend.
 
 The backend sets an HTTP-only session cookie and requires a valid, unexpired backend-issued JWT for protected API requests. Logout revokes the token's server-side session. Session records expire automatically. The frontend server action transfers the cookie to the Vercel domain so the browser does not need to access Render's cross-site cookie directly.
 
@@ -67,15 +71,16 @@ Pop-Location
 
 Do not reuse a production JWT secret for local development.
 
-## Admin Bootstrap and Checks
+## Admin Setup and Checks
 
-On an empty database, run the one-time bootstrap from `backend/` with `MONGODB_URI`, `MONGODB_DB`, `BOOTSTRAP_ADMIN_EMAIL`, `BOOTSTRAP_ADMIN_NAME`, and `BOOTSTRAP_ADMIN_PASSWORD` set in the process environment. The password must be at least 12 characters. The script refuses to run if any profile exists. Regular registrations create patient accounts.
-
+Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` in the backend environment before startup. For a manual idempotent setup, run the helper from `backend/` with the same environment variables:
 ```powershell
 Push-Location backend
 npm run create-admin
 Pop-Location
 ```
+
+Regular registrations create patient accounts. The admin credentials and `JWT_SECRET` must never be configured in Vercel.
 
 Run checks independently from each project directory:
 
@@ -84,4 +89,4 @@ npm ci
 npm run build
 ```
 
-The frontend also has `npm run lint` and `npm run typecheck`. There is no automated test suite configured yet. Keep `.env`, `.env.local`, and all real credentials out of version control; `.env.example` files contain placeholders only. Rotate any MongoDB credential that was previously committed.
+Run the backend authentication and authorization tests with `npm test`. The frontend also has `npm run lint` and `npm run typecheck`. Keep `.env`, `.env.local`, and all real credentials out of version control; `.env.example` files contain placeholders only. Rotate any MongoDB credential that was previously committed.
